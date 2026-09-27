@@ -5,6 +5,7 @@
 /deps/dist*
 /deps/nv-codec-headers
 /deps/libva
+/node_modules
 c_helper/target
 c_helper/Cargo.lock
 *.js

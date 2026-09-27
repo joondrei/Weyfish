@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::{spawn, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::channel;
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::capturable::{get_capturables, Capturable, Recorder};
 use crate::input::device::{InputDevice, InputDeviceType};
@@ -218,13 +218,22 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
         } else {
             false
         };
+
+        #[cfg(target_os = "linux")]
+        if config.capture_cursor != self.capture_cursor {
+            self.capture_cursor = config.capture_cursor;
+            // Under Wayland the cursor mode is part of the portal session and can not be changed
+            // afterwards, so a session that already exists has to be requested again for a changed
+            // setting to take effect. Before the first enumeration there is nothing to recreate:
+            // the upcoming list request simply picks up the new setting, which spares the user a
+            // second "select what to share" dialog.
+            if self.config.wayland_support && !self.capturables.is_empty() {
+                self.send_capturable_list();
+            }
+        }
+
         if config.capturable_id < self.capturables.len() {
             let capturable = self.capturables[config.capturable_id].clone();
-
-            #[cfg(target_os = "linux")]
-            {
-                self.capture_cursor = config.capture_cursor;
-            }
 
             #[cfg(target_os = "linux")]
             if config.uinput_support {
@@ -291,6 +300,10 @@ impl<S, R, FnUInput> WeylusClientHandler<S, R, FnUInput> {
                     frame_rate: config.frame_rate,
                 }))
                 .unwrap();
+        } else if self.capturables.is_empty() {
+            // Clients send their settings before asking for the capturable list. There is nothing
+            // to record yet, the settings are kept and used once the list is known.
+            debug!("Configuration received before any capturable is known, deferring video start.");
         } else {
             error!("Got invalid id for capturable: {}", config.capturable_id);
             self.send_message(MessageOutbound::ConfigError(

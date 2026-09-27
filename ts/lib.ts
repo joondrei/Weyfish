@@ -121,6 +121,8 @@ class Settings {
     visible: boolean;
     custom_input_areas: CustomInputAreas;
     settings: HTMLElement;
+    // Configuration last sent to the server, used to skip redundant updates.
+    last_config_json: string;
 
     constructor(webSocket: WebSocket) {
         this.webSocket = webSocket;
@@ -238,7 +240,7 @@ class Settings {
         this.capturable_select.onchange = () => this.send_server_config();
     }
 
-    send_server_config() {
+    send_server_config(force: boolean = false) {
         let config = new Object(null);
         config["capturable_id"] = Number(this.capturable_select.value);
         for (const key of [
@@ -251,7 +253,13 @@ class Settings {
         config["frame_rate"] = frame_rate_scale(this.frame_rate_input.valueAsNumber);
         if (this.client_name_input.value)
             config["client_name"] = this.client_name_input.value;
-        this.webSocket.send(JSON.stringify({ "Config": config }));
+        let config_json = JSON.stringify({ "Config": config });
+        // Applying an unchanged configuration makes the server rebuild its recorder and encoder
+        // for nothing, so only send actual changes unless the caller knows better.
+        if (!force && config_json === this.last_config_json)
+            return;
+        this.last_config_json = config_json;
+        this.webSocket.send(config_json);
     }
 
     save_settings() {
@@ -374,6 +382,9 @@ class Settings {
         else if (current_selection)
             // Can't find the window, so don't select anything
             this.capturable_select.value = "";
+        // The list has just arrived (or was refreshed), so (re-)send the configuration now that
+        // the selected capturable actually exists.
+        this.send_server_config(true);
     }
 
     toggle_energysaving(energysaving: boolean) {
@@ -947,6 +958,10 @@ function handle_messages(
                     let MS = window.ManagedMediaSource ? window.ManagedMediaSource : window.MediaSource;
                     mediaSource = new MS();
                     sourceBuffer = null;
+                    // The queued frames belong to the previous stream (and possibly a previous
+                    // resolution). Appending them to the new source buffer would corrupt the
+                    // decoding, so drop them.
+                    queue = [];
                     video.src = URL.createObjectURL(mediaSource);
                     mediaSource.addEventListener("sourceopen", (_) => {
                         let mimeType = 'video/mp4; codecs="avc1.4D403D"';
@@ -956,7 +971,9 @@ function handle_messages(
                         sourceBuffer.addEventListener("updateend", upd_buf);
                         // try to recover from errors by restarting the video
                         if (sourceBuffer.onerror)
-                            sourceBuffer.onerror = () => settings.send_server_config();
+                            // force: recovering may well need a restart even though the
+                            // configuration itself did not change.
+                            sourceBuffer.onerror = () => settings.send_server_config(true);
                     })
                 } else if (msg == "ConfigOk") {
                     onConfigOk();
@@ -1074,13 +1091,23 @@ function init() {
     }
     webSocket.onerror = () => handle_disconnect("Lost connection.");
     webSocket.onclose = () => handle_disconnect("Connection closed.");
+    let resize_timeout: number = null;
     window.onresize = () => {
         stretch_video();
         canvas.width = window.innerWidth * window.devicePixelRatio;
         canvas.height = window.innerHeight * window.devicePixelRatio;
         let [w, h] = calc_max_video_resolution(settings.scale_video_input.valueAsNumber);
         settings.scale_video_output.value = w + "x" + h;
-        settings.send_server_config();
+        // A resize fires a burst of events with a continuously changing size, and entering or
+        // leaving fullscreen produces a whole bunch of them. Every size change restarts the
+        // server's video encoder and this client's video element, which stalls the stream, so wait
+        // until the size has settled before telling the server about it.
+        if (resize_timeout != null)
+            window.clearTimeout(resize_timeout);
+        resize_timeout = window.setTimeout(() => {
+            resize_timeout = null;
+            settings.send_server_config();
+        }, 500);
     }
     video.controls = false;
     video.disableRemotePlayback = true;
@@ -1098,11 +1125,14 @@ function init() {
     );
     window.onunload = () => { webSocket.close(); }
     webSocket.onopen = function(event) {
-        webSocket.send('"GetCapturableList"');
+        // Send the settings first: on Wayland the list of capturables is created from a portal
+        // session that bakes in the cursor mode, so the server has to know about it before it
+        // asks the user which source to share. Otherwise they get asked twice.
+        settings.send_server_config();
         if (!settings.video_enabled())
             webSocket.send('"PauseVideo"');
 
-        settings.send_server_config();
+        webSocket.send('"GetCapturableList"');
 
         document.onvisibilitychange = () => {
             if (document.hidden) {

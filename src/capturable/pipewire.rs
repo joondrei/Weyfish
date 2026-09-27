@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
@@ -432,6 +432,76 @@ fn select_devices(
     Ok(())
 }
 
+/// Cursor modes as defined by `org.freedesktop.portal.ScreenCast`.
+/// 1: Hidden. The cursor is not part of the screen cast stream.
+const CURSOR_MODE_HIDDEN: u32 = 1;
+/// 2: Embedded: The cursor is embedded as part of the stream buffers.
+/// (4 would be Metadata, but GStreamer's `pipewiresrc` only forwards the cursor position and
+/// not the cursor image, so a metadata cursor can not be rendered by us.)
+const CURSOR_MODE_EMBEDDED: u32 = 2;
+
+/// Whether Weylus currently runs on KDE Plasma.
+fn is_kde() -> bool {
+    [
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
+    ]
+    .iter()
+    .filter_map(|var| std::env::var(var).ok())
+    .any(|desktop| {
+        desktop.split(':').any(|desktop| {
+            let desktop = desktop.to_ascii_lowercase();
+            desktop.contains("kde") || desktop.contains("plasma")
+        })
+    })
+}
+
+/// Parses a version string like "5.27.5" into major and minor version.
+fn parse_version(s: &str) -> Option<(u64, u64)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.trim().parse().ok()?;
+    let minor = parts.next().unwrap_or("0").trim().parse().ok()?;
+    Some((major, minor))
+}
+
+/// Asks KWin for its version. `supportInformation` contains a line like `KWin version: 5.27.5`.
+fn kwin_version(connection: &SyncConnection) -> Option<(u64, u64)> {
+    static VERSION: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let proxy = Proxy::new(
+            "org.kde.KWin",
+            "/KWin",
+            Duration::from_millis(1000),
+            connection,
+        );
+        let (info,): (String,) = proxy
+            .method_call("org.kde.KWin", "supportInformation", ())
+            .ok()?;
+        info.lines()
+            .find(|line| line.trim().to_ascii_lowercase().starts_with("kwin version"))
+            .and_then(|line| line.rsplit_once(':'))
+            .and_then(|(_, version)| parse_version(version))
+    })
+}
+
+/// KWin used to push a frame from `Cursors::positionChanged()` without a current OpenGL context.
+/// That crashed kwin_wayland and tore down the whole desktop as soon as the cursor was moved
+/// while it was embedded into a screen cast, see:
+/// https://bugs.kde.org/show_bug.cgi?id=448162
+/// This was fixed in Plasma 5.24 by
+/// https://invent.kde.org/plasma/kwin/-/commit/12427932dee29bdcb6831bc906d5a14df3a31461
+fn kwin_cursor_capture_is_safe(connection: &SyncConnection) -> bool {
+    if !is_kde() {
+        return true;
+    }
+    match kwin_version(connection) {
+        Some((major, minor)) => major > 5 || (major == 5 && minor >= 24),
+        // Without a version we can not tell whether this KWin is fixed, so be conservative.
+        None => matches!(std::env::var("KDE_SESSION_VERSION").as_deref(), Ok("6") | Ok("7")),
+    }
+}
+
 fn select_sources(
     portal: Proxy<&SyncConnection>,
     context: Arc<Mutex<CallBackContext>>,
@@ -456,22 +526,27 @@ fn select_sources(
     args.insert("types".into(), Variant(Box::new(source_types)));
 
     let capture_cursor = context.lock().unwrap().capture_cursor;
-    // 1: Hidden. The cursor is not part of the screen cast stream.
-    // 2: Embedded: The cursor is embedded as part of the stream buffers.
-    // 4: Metadata: The cursor is not part of the screen cast stream, but sent as PipeWire stream metadata.
-    let cursor_mode = if capture_cursor { 2u32 } else { 1u32 };
-
-    let is_plasma = std::env::var("DESKTOP_SESSION").map_or(false, |s| s.contains("plasma"));
-    if is_plasma && capture_cursor {
-        // Warn the user if capturing the cursor is tried on kde as this can crash
-        // kwin_wayland and tear down the plasma desktop, see:
-        // https://bugs.kde.org/show_bug.cgi?id=435042
-        warn!(
-            "You are attempting to capture the cursor under KDE Plasma, this may crash your \
-                    desktop, see https://bugs.kde.org/show_bug.cgi?id=435042 for details! \
-                    You have been warned."
-        );
-    }
+    let cursor_mode = match portal.available_cursor_modes() {
+        // Requesting a cursor mode the compositor does not advertise causes it to close the
+        // screen cast session, so only ask for a mode that is on offer.
+        Ok(modes) if capture_cursor && (modes & CURSOR_MODE_EMBEDDED) == 0 => {
+            warn!(
+                "Compositor does not support embedding the cursor into the screen cast \
+                (available cursor modes: {modes:#x}), falling back to a screen cast without \
+                cursor."
+            );
+            CURSOR_MODE_HIDDEN
+        }
+        // Portals without cursor mode support do not have this property, keep working as before.
+        _ => {
+            if capture_cursor {
+                CURSOR_MODE_EMBEDDED
+            } else {
+                CURSOR_MODE_HIDDEN
+            }
+        }
+    };
+    debug!("Requesting cursor mode: {cursor_mode}.");
     args.insert("cursor_mode".into(), Variant(Box::new(cursor_mode)));
 
     let path = portal.select_sources(context.lock().unwrap().session.clone(), args)?;
@@ -546,6 +621,19 @@ fn request_remote_desktop(
     // List of supported DEs: https://wiki.archlinux.org/title/XDG_Desktop_Portal#List_of_backends_and_interfaces
     let has_remote_desktop =
         std::env::var("DESKTOP_SESSION").map_or(false, |s| s.contains("gnome"));
+
+    // Refuse to embed the cursor on compositors known to crash when doing so. A screen cast
+    // without a cursor beats a dead desktop, see `kwin_cursor_capture_is_safe`.
+    let capture_cursor = if capture_cursor && !kwin_cursor_capture_is_safe(&conn) {
+        warn!(
+            "Not capturing the cursor: this KWin version can crash your desktop as soon as the \
+            cursor is moved while it is embedded into a screen cast, see \
+            https://bugs.kde.org/show_bug.cgi?id=448162. Plasma 5.24.1 or newer is required."
+        );
+        false
+    } else {
+        capture_cursor
+    };
 
     let context = CallBackContext {
         capture_cursor,
